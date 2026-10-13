@@ -34,17 +34,29 @@ The interface and the generated API documentation are written in Chinese.
 ## Features
 
 **Three input modes** — file upload (JPG / PNG / WebP / BMP), a live webcam capture, or a
-remote image URL.
+remote image URL. The upload tab accepts several files at once.
+
+**One container per image** — batch uploads are laid out as a stack of bordered cards, one
+per image. Inside a card the input image and the annotated result sit side by side in
+three equal columns (so each renders at roughly a third of the page width and the pair
+stays on one row), the third column carries that image's numbers and export buttons, and
+the progress bar plus the data curves run full width beneath them.
+
+**Live inference progress** — while a detection runs, its card shows a percentage bar, a
+stage strip (receive → resize → load weights → inference → decode boxes → draw → encode),
+the elapsed time, and real measurements taken during the run: per-stage timings, image
+statistics, and GPU utilisation / VRAM sampled at every pipeline boundary.
 
 **A shared detection core** — `detector.py` is the single source of truth for inference
 and annotation. The API, the UI and the CLIs cannot drift apart, because they call the
-same functions.
+same functions (`detect()` and the streaming `detect_stream()` share one implementation).
 
 **FastAPI backend** — a documented service (`/docs`) with:
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /detect` | Run detection, return JSON (optionally with the annotated image embedded as a data URI) |
+| `POST /detect/stream` | Same, but streams each pipeline stage as an NDJSON line before the final result |
 | `POST /detect/image` | Run detection, return the annotated image as PNG |
 | `GET /models` | List built-in, custom and already-cached models |
 | `POST /models/upload` | Install a custom `.pt` weight file |
@@ -86,12 +98,14 @@ executes pickle data.
                              ▼
                  ┌──────────────────────────────┐
    curl / app ─► │  FastAPI service (api.py)    │
-                 │  /detect · /detect/image     │
+                 │  /detect · /detect/stream    │
+                 │  /detect/image               │
                  └───────────┬──────────────────┘
                              │
                              ▼
                  ┌──────────────────────────────┐
                  │  detector.py                 │
+                 │  detect() / detect_stream()  │
                  │  load · infer · annotate     │
                  └───────────┬──────────────────┘
                              │
@@ -118,8 +132,9 @@ one-off kernel warm-up cost, which `POST /warmup` exists to absorb.
 
 ### Windows — one double-click
 
-Clone the repository, then double-click **`一键启动.bat`** (Chinese messages) or
-**`OneClick-Start.bat`** (ASCII-only). The launcher sets up the environment, starts both
+Clone the repository, then double-click **`Launch.bat`**, or the equivalent
+**`OneClick-Start.bat`**. Both are thin ASCII-only wrappers around `start.ps1`, which is
+where the Chinese messages come from; the launcher sets up the environment, starts both
 halves of the app, and opens the browser at the Streamlit UI.
 
 It looks for a Python interpreter in this order:
@@ -144,7 +159,7 @@ powershell -ExecutionPolicy Bypass -File start.ps1 -?
 
 ### 中文快速开始
 
-1. 克隆仓库后，双击项目根目录的 **`一键启动.bat`**。
+1. 克隆仓库后，双击项目根目录的 **`Launch.bat`**（内容为纯 ASCII，中文提示由 `start.ps1` 输出）。
 2. 脚本会自动准备 Python 环境、安装缺失的依赖、启动后端与前端，并打开浏览器。
 3. 首次运行会下载 YOLOv8 权重（`yolov8n` 约 6 MB），请保持网络畅通。
 4. 只想安装环境而不启动服务，使用 `OneClick-Start.bat -SetupOnly`。
@@ -192,6 +207,32 @@ curl -X POST http://localhost:8000/detect/image \
 # Warm the model up so the first user upload is fast
 curl -X POST http://localhost:8000/warmup
 ```
+
+### Streaming progress (what the UI's progress bar reads)
+
+`POST /detect/stream` returns the same payload as `POST /detect`, but first emits one
+newline-delimited JSON record per pipeline stage. `-N` disables curl's output buffering:
+
+```bash
+curl -N -X POST http://localhost:8000/detect/stream \
+  -F 'file=@samples/bus.jpg' \
+  -F 'confidence=0.5' -F 'model=yolov8n' -F 'max_size=1280'
+```
+
+```json
+{"type":"progress","stage":"queued","label":"排队","stage_index":0,"stage_total":9,"elapsed_ms":0.0}
+{"type":"progress","stage":"resized","label":"缩放预处理","stage_index":2,"elapsed_ms":12.4,"width":480,"height":640,"megapixels":0.307,"brightness":116.4,"contrast":60.4,"sharpness":6295.4,"gpu_util_pct":8,"vram_used_mb":812.5,"vram_total_mb":16376.0}
+{"type":"progress","stage":"inferred","label":"模型推理","stage_index":4,"elapsed_ms":247.9,"inference_ms":231.7,"gpu_util_pct":78}
+{"type":"result","success":true,"count":4,"inference_ms":231.7,"total_ms":312.5,"detections":[...],"summary":[...]}
+```
+
+Only two event types exist: `progress` (repeatable) and `result` (always last). Failures
+after the stream has started arrive as `{"type":"error","message":...}`, because the HTTP
+status is committed before inference begins — read that event rather than the status code.
+
+Per-stage milliseconds are deltas between consecutive `elapsed_ms` values, so a client can
+plot either the step that cost the time or the cumulative curve. `vram_*` / `gpu_util_pct`
+appear only when the request runs on a CUDA device.
 
 ### Single image
 
@@ -245,8 +286,8 @@ Every setting has a built-in default, so a `.env` file is optional. Copy `.env.e
 
 ```
 Yolo_Building-an-Object-Detection-Web/
-├── 一键启动.bat             # one-click launcher (Chinese messages)
-├── OneClick-Start.bat       # one-click launcher (ASCII only)
+├── Launch.bat               # one-click launcher (ASCII wrapper, double-click this)
+├── OneClick-Start.bat       # equivalent earlier launcher, kept for compatibility
 ├── start.ps1                # the launcher: interpreter, deps, both servers, browser
 ├── api.py                   # FastAPI backend          -> uvicorn api:app
 ├── app.py                   # Streamlit frontend       -> streamlit run app.py

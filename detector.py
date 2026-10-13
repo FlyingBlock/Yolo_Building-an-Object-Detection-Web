@@ -24,7 +24,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import cv2
 import numpy as np
@@ -395,6 +395,154 @@ def draw_detections(rgb: np.ndarray, detections: Sequence[dict[str, Any]]) -> np
 # DETECTION
 # ============================================================
 
+# ---- progress reporting -------------------------------------------------
+#
+# Inference itself is a single opaque call into Ultralytics, so there is no
+# per-epoch loss curve to show for a single image. What *can* be reported honestly
+# is the pipeline: decode -> resize -> load -> infer -> annotate, with wall-clock
+# time and (when CUDA is in play) utilisation/VRAM sampled at each boundary, plus
+# the detector's own view of the image it is about to look at. detect_stream()
+# emits one event per boundary; detect() is the same code with the reporting
+# switched off, which is why both share _detect_locked().
+
+# Order matters: it is the real execution order, so a consumer can trust
+# `stage_index` to advance monotonically, and it is the order stages appear in the
+# progress strip and in the timing curve. Keys are wire values; labels are Chinese
+# because they are rendered directly in the UI and in the JSON event stream.
+STAGE_LABELS: dict[str, str] = {
+    "queued": "排队",
+    "received": "接收图片",
+    "resized": "缩放预处理",
+    "model_loaded": "加载权重",
+    "inferred": "模型推理",
+    "decoded": "解析检测框",
+    "annotated": "绘制标注",
+    "encoded": "编码输出",
+    "done": "完成",
+}
+STAGE_ORDER: tuple[str, ...] = tuple(STAGE_LABELS)
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+# The sink the pipeline reports to. It is a module global rather than a parameter
+# because _detect_locked() is reached through two public entry points that must
+# behave identically; _set_emit() swaps it for the duration of a stream. The
+# default swallows both positional and keyword extras so a plain detect() call
+# reports to nobody without paying for any bookkeeping.
+_active_emit: ProgressCallback = lambda *args, **kwargs: None  # noqa: E731
+
+
+def _set_emit(emit: ProgressCallback) -> ProgressCallback:
+    """Install a progress sink; returns the previous one so callers can restore it."""
+    global _active_emit
+    previous, _active_emit = _active_emit, emit
+    return previous
+
+
+def _emit_stage(emit: ProgressCallback, stage: str, **extra: Any) -> None:
+    """Thin indirection so the pipeline has exactly one reporting call site shape."""
+    emit(stage, **extra)
+
+
+def _new_progress_callback(sink: ProgressCallback, sync_gpu: bool = False) -> ProgressCallback:
+    """
+    Wrap a user sink so every emitted event also carries timing and hardware data.
+
+    `time_ms` is measured from the first event; `elapsed_ms` is the same clock, so
+    a consumer can plot either the per-stage delta or the cumulative curve.
+    GPU numbers are sampled on demand and skipped entirely when CUDA is absent.
+    """
+    started = time.perf_counter()
+
+    def _emit(stage: str, **extra: Any) -> None:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        event: dict[str, Any] = {
+            "stage": stage,
+            "label": STAGE_LABELS.get(stage, stage),
+            "stage_index": STAGE_ORDER.index(stage) if stage in STAGE_ORDER else -1,
+            "stage_total": len(STAGE_ORDER),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "time_ms": round(elapsed_ms, 1),
+        }
+        if sync_gpu:
+            event.update(_gpu_snapshot())
+        if extra:
+            event.update(extra)
+        try:
+            sink(event)
+        except Exception:  # a broken observer inside a worker thread would
+            pass          # otherwise take the whole detection down with it
+
+    return _emit
+
+
+def _gpu_snapshot() -> dict[str, Any]:
+    """Best-effort CUDA utilisation/VRAM sample; empty dict on failure or no GPU."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+        free, total = torch.cuda.mem_get_info()
+        snapshot: dict[str, Any] = {
+            "vram_used_mb": round((total - free) / 1024 / 1024, 1),
+            "vram_total_mb": round(total / 1024 / 1024, 1),
+            "vram_util_pct": round(100.0 * (total - free) / total, 1) if total else 0.0,
+        }
+        try:  # nvidia-ml-py is optional; recent torch ships it, older ones do not
+            import pynvml
+
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            snapshot["gpu_util_pct"] = int(rates.gpu)
+            snapshot["gpu_mem_util_pct"] = int(rates.memory)
+        except Exception:
+            pass
+        return snapshot
+    except Exception:  # pragma: no cover - depends on the local CUDA stack
+        return {}
+
+
+def _image_metrics(rgb: np.ndarray) -> dict[str, Any]:
+    """
+    Cheap statistics describing the frame the detector is about to look at.
+
+    These are what the UI plots live while inference runs, and they are measured on
+    the (possibly downscaled) working image, so they double as a sanity check that
+    preprocessing did what the caller asked for.
+    """
+    height, width = rgb.shape[:2]
+    try:
+        # A 64x64 thumbnail keeps this in the sub-millisecond range on any input.
+        small = cv2.resize(rgb, (64, 64), interpolation=cv2.INTER_AREA)
+        luma = (
+            0.299 * small[..., 0].astype(np.float32)
+            + 0.587 * small[..., 1].astype(np.float32)
+            + 0.114 * small[..., 2].astype(np.float32)
+        )
+        brightness = float(luma.mean())
+        contrast = float(luma.std())
+        sharpness = float(cv2.Laplacian(luma, cv2.CV_32F).var())
+        # Mean colour cast: how far each channel sits from neutral grey.
+        cast = [round(float(channel), 1) for channel in small.reshape(-1, 3).mean(axis=0)]
+    except Exception:  # pragma: no cover - defensive only
+        brightness = contrast = sharpness = 0.0
+        cast = [0.0, 0.0, 0.0]
+
+    megapixels = (width * height) / 1e6
+    return {
+        "width": int(width),
+        "height": int(height),
+        "megapixels": round(megapixels, 3),
+        "aspect": round(width / height, 3) if height else 0.0,
+        "brightness": round(brightness, 1),
+        "contrast": round(contrast, 1),
+        "sharpness": round(sharpness, 1),
+        "rgb_mean": cast,
+    }
+
+
 def _normalise_names(names: Any) -> dict[int, str]:
     if isinstance(names, dict) and names:
         return {int(k): str(v) for k, v in names.items()}
@@ -425,39 +573,182 @@ def detect(
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("期望传入形状为 (H, W, 3) 的 RGB 图像数组。")
 
-    conf = CONFIDENCE_THRESHOLD if confidence is None else float(confidence)
-    iou_threshold = IOU_THRESHOLD if iou is None else float(iou)
-    if not 0.0 < conf <= 1.0:
-        raise ValueError("confidence 必须位于 (0, 1] 区间内。")
-    if not 0.0 < iou_threshold <= 1.0:
-        raise ValueError("iou 必须位于 (0, 1] 区间内。")
+    conf = _check_unit_interval("confidence", confidence, CONFIDENCE_THRESHOLD)
+    iou_threshold = _check_unit_interval("iou", iou, IOU_THRESHOLD)
 
+    work, scale = _fit_for_inference(image, max_size)
+    # Same lock, same span as before this module gained a streaming twin: load plus
+    # predict, so a stream and a plain call can never interleave on one GPU.
+    with _infer_lock:
+        return _detect_locked(
+            image=image,
+            work=work,
+            scale=scale,
+            model=model,
+            conf=conf,
+            iou_threshold=iou_threshold,
+            device=device,
+            annotate=annotate,
+            classes=classes,
+            image_format=image_format,
+            image_quality=image_quality,
+        )
+
+
+def detect_stream(
+    image: np.ndarray,
+    model: str | None = None,
+    confidence: float | None = None,
+    iou: float | None = None,
+    device: str | None = None,
+    max_size: int | None = None,
+    annotate: bool = True,
+    classes: Iterable[int] | None = None,
+    image_format: str = "jpeg",
+    image_quality: int = 90,
+) -> Iterator[dict[str, Any]]:
+    """
+    Same detection as detect(), but reporting each pipeline stage as it completes.
+
+    Yields progress events shaped like::
+
+        {"type": "progress", "stage": "resized", "label": "缩放预处理",
+         "stage_index": 3, "stage_total": 9,
+         "elapsed_ms": 12.4, "time_ms": 12.4,
+         "width": 1280, "height": 853, "megapixels": 1.09,
+         "brightness": 118.2, "contrast": 47.1, "sharpness": 903.4,
+         "gpu_util_pct": 37, "vram_used_mb": 812.5, ...}
+
+    and finishes with a single ``{"type": "result", ...}`` event carrying exactly
+    the dict detect() would have returned. The caller is expected to consume the
+    generator to exhaustion (or close it, which stops the pipeline at the next
+    stage boundary and frees the inference lock).
+
+    The whole pipeline -- including the model load -- runs inside the same
+    ``_infer_lock`` detect() takes, so a stream and a plain call can never overlap
+    on one GPU.
+    """
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("期望传入形状为 (H, W, 3) 的 RGB 图像数组。")
+    conf = _check_unit_interval("confidence", confidence, CONFIDENCE_THRESHOLD)
+    iou_threshold = _check_unit_interval("iou", iou, IOU_THRESHOLD)
+
+    queue: list[dict[str, Any]] = []
+    # GPU sampling only makes sense when we are about to run on a CUDA device, and
+    # resolve_device(None) is cheap relative to everything that follows.
+    sync_gpu = resolve_device(device).startswith("cuda")
+
+    with _infer_lock:
+        emit = _new_progress_callback(queue.append, sync_gpu=sync_gpu)
+        restore_emit = _set_emit(emit)
+
+        def drain() -> Iterator[dict[str, Any]]:
+            while queue:
+                event = dict(queue.pop(0))
+                event.setdefault("type", "progress")
+                yield event
+
+        try:
+            emit("queued")
+
+            work, scale = _fit_for_inference(image, max_size)
+            yield from drain()
+
+            payload = _detect_locked(
+                image=image,
+                work=work,
+                scale=scale,
+                model=model,
+                conf=conf,
+                iou_threshold=iou_threshold,
+                device=device,
+                annotate=annotate,
+                classes=classes,
+                image_format=image_format,
+                image_quality=image_quality,
+            )
+            yield from drain()
+            yield {"type": "result", **payload}
+        finally:
+            _set_emit(restore_emit)
+
+
+def _check_unit_interval(name: str, value: float | None, default: float) -> float:
+    resolved = default if value is None else float(value)
+    if not 0.0 < resolved <= 1.0:
+        raise ValueError(f"{name} 必须位于 (0, 1] 区间内。")
+    return resolved
+
+
+def _fit_for_inference(image: np.ndarray, max_size: int | None) -> tuple[np.ndarray, float]:
+    """Downscale the long edge to `max_size`; return (working image, scale factor)."""
     limit = MAX_IMAGE_SIZE if max_size is None else int(max_size)
     original_h, original_w = image.shape[:2]
-    scale = 1.0
-    work = image
-    if limit and max(original_h, original_w) > limit:
-        scale = limit / float(max(original_h, original_w))
-        work = cv2.resize(
-            image,
-            (max(1, int(round(original_w * scale))), max(1, int(round(original_h * scale)))),
-            interpolation=cv2.INTER_AREA,
-        )
+    if not limit or max(original_h, original_w) <= limit:
+        return image, 1.0
+    scale = limit / float(max(original_h, original_w))
+    work = cv2.resize(
+        image,
+        (max(1, int(round(original_w * scale))), max(1, int(round(original_h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+    return work, scale
+
+
+def _detect_locked(
+    *,
+    image: np.ndarray,
+    work: np.ndarray,
+    scale: float,
+    model: str | None,
+    conf: float,
+    iou_threshold: float,
+    device: str | None,
+    annotate: bool,
+    classes: Iterable[int] | None,
+    image_format: str,
+    image_quality: int,
+) -> dict[str, Any]:
+    """
+    The detection pipeline itself, reporting through the active progress sink.
+
+    detect() and detect_stream() both land here, so the events a caller sees and
+    the payload it receives can never drift apart. Preprocessing decisions (the
+    resize, the thresholds) are resolved by the caller; this function only runs the
+    stages and reports them.
+
+    The caller must hold ``_infer_lock``.
+    """
+    emit = _active_emit
+    original_h, original_w = image.shape[:2]
+    _emit_stage(emit, "received", source_bytes=None)
+
+    _emit_stage(
+        emit, "resized",
+        **_image_metrics(work),
+        source_width=int(original_w),
+        source_height=int(original_h),
+        scale=round(scale, 4),
+        resized=work is not image,
+    )
 
     active_device = resolve_device(device)
+    load_started = time.perf_counter()
     yolo = load_model(model, active_device)
+    load_ms = (time.perf_counter() - load_started) * 1000.0
+    _emit_stage(emit, "model_loaded", load_ms=round(load_ms, 1))
 
-    started = time.perf_counter()
-    with _infer_lock:
-        results = yolo.predict(
-            source=work,
-            conf=conf,
-            iou=iou_threshold,
-            device=active_device,
-            verbose=False,
-            classes=list(classes) if classes is not None else None,
-        )
-    inference_ms = (time.perf_counter() - started) * 1000.0
+    infer_started = time.perf_counter()
+    results = yolo.predict(
+        source=work,
+        conf=conf,
+        iou=iou_threshold,
+        device=active_device,
+        verbose=False,
+        classes=list(classes) if classes is not None else None,
+    )
+    inference_ms = (time.perf_counter() - infer_started) * 1000.0
+    _emit_stage(emit, "inferred", inference_ms=round(inference_ms, 1))
 
     result = results[0]
     names = _normalise_names(getattr(result, "names", None) or getattr(yolo, "names", None))
@@ -491,11 +782,18 @@ def detect(
                     },
                 }
             )
+            # Report every so often (and once at the end) so that a crowded frame --
+            # where this walk is the slowest post-processing step -- still animates
+            # the progress bar without paying for an event per box.
+            if len(detections) % 16 == 0:
+                _emit_stage(emit, "decoded", parsed=len(detections), total=int(len(boxes)))
+    _emit_stage(emit, "decoded", parsed=len(detections), total=len(detections))
 
     counts: dict[str, int] = {}
     for det in detections:
         counts[det["class_name"]] = counts.get(det["class_name"], 0) + 1
 
+    scores = [det["confidence"] for det in detections]
     payload: dict[str, Any] = {
         "model": resolve_model_ref(model),
         "device": active_device,
@@ -503,17 +801,41 @@ def detect(
         "iou_threshold": iou_threshold,
         "image": {"width": int(original_w), "height": int(original_h), "inferred_at_scale": round(scale, 4)},
         "inference_ms": round(inference_ms, 1),
+        "load_ms": round(load_ms, 1),
+        "preprocess": {
+            "scale": round(scale, 4),
+            "resized": work is not image,
+            "inference_width": int(work.shape[1]),
+            "inference_height": int(work.shape[0]),
+        },
         "count": len(detections),
         "counts_by_class": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
         "detections": detections,
+        "scores": {
+            "mean_confidence": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "max_confidence": round(max(scores), 4) if scores else 0.0,
+            "min_confidence": round(min(scores), 4) if scores else 0.0,
+        },
     }
     if annotate:
+        draw_started = time.perf_counter()
         annotated = draw_detections(image, detections)
+        draw_ms = (time.perf_counter() - draw_started) * 1000.0
+        _emit_stage(emit, "annotated", draw_ms=round(draw_ms, 1), count=len(detections))
+
+        encode_started = time.perf_counter()
         fmt = (image_format or "jpeg").lower()
         mime = "image/png" if fmt == "png" else "image/jpeg"
-        payload["annotated_image"] = to_data_uri(
-            encode_image(annotated, fmt, image_quality), mime
+        encoded = encode_image(annotated, fmt, image_quality)
+        payload["annotated_image"] = to_data_uri(encoded, mime)
+        payload["annotated_bytes"] = len(encoded)
+        _emit_stage(
+            emit, "encoded",
+            draw_ms=round(draw_ms, 1),
+            encode_ms=round((time.perf_counter() - encode_started) * 1000.0, 1),
+            annotated_bytes=len(encoded),
         )
+    _emit_stage(emit, "done", count=len(detections), inference_ms=round(inference_ms, 1))
     return payload
 
 

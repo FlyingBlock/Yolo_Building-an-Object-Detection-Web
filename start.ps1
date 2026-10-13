@@ -5,7 +5,7 @@
 #     * FastAPI backend   (api.py)   -> http://127.0.0.1:8000  (+ /docs)
 #     * Streamlit UI      (app.py)   -> http://localhost:8501
 #
-#  Normally you never call this file directly -- double-click "一键启动.bat".
+#  Normally you never call this file directly -- double-click "Launch.bat".
 #
 #  Interpreter priority:
 #     1. -PythonPath <python.exe>            (explicit override)
