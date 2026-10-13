@@ -1,0 +1,8 @@
+# Extra dependencies for the preserved quantum_dream_atlas.py visualisation.
+# It is unrelated to object detection and is not required by the web app.
+streamlit>=1.36
+plotly>=5.18
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+torch>=2.2
