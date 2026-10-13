@@ -1,6 +1,14 @@
 MIT License
 
 Copyright (c) 2025 Debanik21
+Copyright (c) 2025 FlyingBlock
+
+This repository is a derivative of
+https://github.com/Devanik21/Yolo_Building-an-Object-Detection-Web-App by Devanik Debnath
+(GitHub @Devanik21), licensed under the MIT License.
+
+The first copyright notice above is the original one and is retained unchanged, as the MIT
+License requires. The second notice covers the modifications made in this repository.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
