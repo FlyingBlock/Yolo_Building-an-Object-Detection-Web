@@ -13,10 +13,10 @@ rem  start.ps1 does all of it in one process tree, so no conda activation,
 rem  no "cd /d" and no second window are required.
 rem
 rem  Optional arguments (same as start.ps1), for example:
-rem      OneClick-Start.bat -ApiPort 8010 -UiPort 8511
-rem      OneClick-Start.bat -NoBrowser
-rem      OneClick-Start.bat -CondaEnv yolo
-rem      OneClick-Start.bat -NoConda
+rem      Launch.bat -ApiPort 8010 -UiPort 8511
+rem      Launch.bat -NoBrowser
+rem      Launch.bat -CondaEnv yolo
+rem      Launch.bat -NoConda
 rem
 rem  IMPORTANT: this file is deliberately ASCII-only. cmd.exe mis-parses
 rem  non-ASCII bytes inside .bat files (a full-width colon breaks "rem" and
