@@ -1,1236 +1,692 @@
 """
-QUANTUM DREAM ATLAS
-The Most Aesthetically Beautiful & Scientifically Advanced Visualization Engine
-21 Advanced Subjects × 16 Dynamic Plots = 336 Nobel-Tier Visualizations
+Streamlit frontend for YOLO object detection.
+
+Run it with:
+
+    streamlit run app.py
+
+It talks to the FastAPI backend from api.py over HTTP (start that first with
+`uvicorn api:app --reload --port 8000`), and can also fall back to running the
+model in-process if you would rather not start the backend -- both paths call the
+same code in detector.py, so results are identical.
+
+On Windows the easiest way to start both halves at once is the one-click launcher
+at the repository root: double-click `一键启动.bat` (or `OneClick-Start.bat`),
+which sets up the environment, starts the API and this UI, and opens the browser.
 """
 
-import streamlit as st
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import scipy.linalg as la
-from scipy.spatial import Delaunay
-from scipy.stats import multivariate_normal
-from scipy.integrate import odeint
-from scipy.special import sph_harm_y, legendre
-import colorsys
+from __future__ import annotations
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-st.set_page_config(
-    page_title="Quantum Dream Atlas ✨",
-    layout="wide",
-    page_icon="✨",
-    initial_sidebar_state="collapsed"
+import base64
+import io
+import json
+import os
+import time
+from typing import Any
+
+import pandas as pd
+import requests
+import streamlit as st
+
+APP_TITLE = "YOLO 目标检测"
+DEFAULT_API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
+IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "bmp"]
+URL_MAX_MB = 25.0
+
+# Fallback used only if neither the API nor detector.py can be reached. The real
+# list is discovered at runtime -- see load_model_catalogue() -- so weights dropped
+# into models/ show up here without editing this file.
+FALLBACK_MODEL_ALIASES = [
+    "yolov8n", "yolov8s", "yolov8m", "yolov8l",
+    "yolo11n", "yolo11s", "yolo11m",
+]
+MODEL_SOURCE_API = "API（GET /models）"
+MODEL_SOURCE_LOCAL = "本地目录探测"
+
+# The backend labels are UI text as well as branch conditions, so they live in one
+# place: run_detection(), the sidebar radio and the API errors all key off them.
+REST_BACKEND_LABEL = "REST API（uvicorn 服务）"
+LOCAL_BACKEND_LABEL = "本地推理（进程内）"
+BACKEND_OPTIONS = [REST_BACKEND_LABEL, LOCAL_BACKEND_LABEL]
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🎯", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2rem; }
+      .stTabs [data-baseweb="tab-list"] { gap: 0.5rem; }
+      div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.markdown("""
-    <style>
-    .stApp {
-        background-color: #000000;
-    }
-    div.block-container {
-        padding-top: 2rem;
-    }
-    h1, h2, h3, h4 {
-        color: #00ffaa !important;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
 # ============================================================
-# MASTER RANDOM SEED GENERATOR
-# ============================================================
-if 'master_seed' not in st.session_state:
-    st.session_state.master_seed = np.random.randint(0, 1000000)
-
-def get_seed(offset=0):
-    """Generate deterministic but unique seed for each plot"""
-    return st.session_state.master_seed + offset
-
-# ============================================================
-# ADVANCED PLOTTING FUNCTIONS (Perspective Variations)
+# BACKENDS
 # ============================================================
 
-def create_dark_layout():
-    """Master dark theme layout"""
-    return dict(
-        paper_bgcolor='#000000',
-        plot_bgcolor='#000000',
-        font=dict(color='#00ffaa', size=10),
-        scene=dict(
-            xaxis=dict(backgroundcolor='#000000', gridcolor='#001a1a', showbackground=True),
-            yaxis=dict(backgroundcolor='#000000', gridcolor='#001a1a', showbackground=True),
-            zaxis=dict(backgroundcolor='#000000', gridcolor='#001a1a', showbackground=True)
-        ),
-        xaxis=dict(gridcolor='#001a1a', zerolinecolor='#003333'),
-        yaxis=dict(gridcolor='#001a1a', zerolinecolor='#003333'),
-        margin=dict(l=0, r=0, t=30, b=0),
-        showlegend=False,
-        height=400
+class BackendError(RuntimeError):
+    """A failure the user can act on: backend down, bad image, bad settings."""
+
+
+def api_models(api_url: str) -> dict[str, Any]:
+    """Ask the backend which models it can actually load (builtin + models/)."""
+    response = requests.get(f"{api_url.rstrip('/')}/models", timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("GET /models 返回了非预期的响应。")
+    return payload
+
+
+def api_upload_model(api_url: str, filename: str, data: bytes) -> dict[str, Any]:
+    """Install a .pt into the backend's models/ directory via POST /models/upload."""
+    response = requests.post(
+        f"{api_url.rstrip('/')}/models/upload",
+        files={"file": (filename, data, "application/octet-stream")},
+        timeout=300,
     )
+    if response.status_code != 200:
+        detail = response.text
+        try:
+            detail = response.json().get("detail", detail)
+        except ValueError:
+            pass
+        raise BackendError(f"上传失败（HTTP {response.status_code}）：{detail}")
+    return response.json()
 
-def quantum_colorscale(name='viridis'):
-    """Beautiful dark-themed colorscales"""
-    scales = {
-        'viridis': [[0, '#000033'], [0.3, '#440154'], [0.6, '#31688e'], [0.8, '#35b779'], [1, '#fde724']],
-        'plasma': [[0, '#0d0887'], [0.3, '#7e03a8'], [0.6, '#cc4778'], [0.8, '#f89540'], [1, '#f0f921']],
-        'inferno': [[0, '#000004'], [0.3, '#420a68'], [0.6, '#932667'], [0.8, '#dd513a'], [1, '#fcffa4']],
-        'magma': [[0, '#000004'], [0.3, '#3b0f70'], [0.6, '#8c2981'], [0.8, '#de4968'], [1, '#fcfdbf']],
-        'turbo': [[0, '#30123b'], [0.25, '#4777ef'], [0.5, '#1ac938'], [0.75, '#f0b32f'], [1, '#7a0403']],
-        'quantum': [[0, '#000033'], [0.2, '#0a4d8c'], [0.4, '#00a5a8'], [0.6, '#00d696'], [0.8, '#7ef542'], [1, '#f0ff00']],
-        'dream': [[0, '#000000'], [0.25, '#1a0033'], [0.5, '#4d0099'], [0.75, '#9933ff'], [1, '#00ffff']],
-        'fire': [[0, '#000000'], [0.25, '#330000'], [0.5, '#cc0000'], [0.75, '#ff6600'], [1, '#ffff00']],
-        'ice': [[0, '#000033'], [0.25, '#003366'], [0.5, '#0066cc'], [0.75, '#33ccff'], [1, '#ffffff']],
-        'aurora': [[0, '#001a00'], [0.3, '#004d00'], [0.5, '#00ff00'], [0.7, '#00ffcc'], [1, '#00ffff']],
-    }
-    return scales.get(name, scales['quantum'])
 
-# ============================================================
-# CORE VISUALIZATION ENGINE
-# ============================================================
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_remote_catalogue(api_url: str) -> dict[str, Any]:
+    """Ask the backend for its model list (cached ~15 s; see the sidebar refresh)."""
+    return api_models(api_url)
 
-def manifold_3d(seed, subject_id, plot_id, colorscale='quantum'):
-    """3D manifold surface - base template for all subjects"""
-    np.random.seed(seed)
-    n = 80
-    x = np.linspace(-3, 3, n)
-    y = np.linspace(-3, 3, n)
-    X, Y = np.meshgrid(x, y)
-    
-    # Subject-specific mathematical transformation
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    Z = (np.sin(X * np.cos(phi) + Y * np.sin(phi)) * 
-         np.exp(-0.1 * (X**2 + Y**2)) * 
-         np.cos(X * Y * psi) * 
-         (1 + 0.3 * np.sin(X * 3 + phi) * np.cos(Y * 3 + psi)))
-    
-    Z += 0.2 * np.random.randn(n, n) * np.exp(-0.2 * (X**2 + Y**2))
-    
-    fig = go.Figure(data=[go.Surface(
-        x=X, y=Y, z=Z,
-        colorscale=quantum_colorscale(colorscale),
-        showscale=False,
-        lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
-        lightposition=dict(x=100, y=100, z=200)
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    fig.update_layout(
-        scene=dict(
-            camera=dict(eye=dict(x=1.5*np.cos(phi), y=1.5*np.sin(psi), z=1.2)),
-            aspectmode='cube'
-        )
-    )
-    return fig
 
-def quantum_field_2d(seed, subject_id, plot_id, colorscale='viridis'):
-    """2D quantum field heatmap"""
-    np.random.seed(seed)
-    n = 120
-    x = np.linspace(-4, 4, n)
-    y = np.linspace(-4, 4, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    Z = np.exp(-0.15 * (X**2 + Y**2)) * (
-        np.sin(X * 2 * np.cos(phi) + Y * 2 * np.sin(psi)) +
-        0.5 * np.cos(X * Y * 3) * np.sin((X**2 + Y**2) * psi)
-    )
-    
-    fig = go.Figure(data=go.Heatmap(
-        x=x, y=y, z=Z,
-        colorscale=quantum_colorscale(colorscale),
-        showscale=False
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
+def local_model_catalogue() -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Ask detector.py directly what it can load: (catalogue, note).
 
-def topology_network(seed, subject_id, plot_id):
-    """Topological network visualization"""
-    np.random.seed(seed)
-    n = 50
-    
-    # Generate points in topological space
-    theta = np.linspace(0, 2*np.pi, n)
-    r = 1 + 0.3 * np.sin(subject_id * theta + plot_id)
-    x = r * np.cos(theta) + 0.1 * np.random.randn(n)
-    y = r * np.sin(theta) + 0.1 * np.random.randn(n)
-    z = 0.5 * np.sin(3 * theta + plot_id) + 0.1 * np.random.randn(n)
-    
-    # Compute connections based on distance threshold
-    threshold = 0.6
-    edges_x, edges_y, edges_z = [], [], []
-    
-    for i in range(n):
-        for j in range(i+1, n):
-            dist = np.sqrt((x[i]-x[j])**2 + (y[i]-y[j])**2 + (z[i]-z[j])**2)
-            if dist < threshold:
-                edges_x.extend([x[i], x[j], None])
-                edges_y.extend([y[i], y[j], None])
-                edges_z.extend([z[i], z[j], None])
-    
-    fig = go.Figure()
-    
-    # Edges
-    fig.add_trace(go.Scatter3d(
-        x=edges_x, y=edges_y, z=edges_z,
-        mode='lines',
-        line=dict(color='#00ffaa', width=1.5),
-        opacity=0.3,
-        hoverinfo='none'
-    ))
-    
-    # Nodes
-    fig.add_trace(go.Scatter3d(
-        x=x, y=y, z=z,
-        mode='markers',
-        marker=dict(size=4, color=z, colorscale=quantum_colorscale('quantum'), showscale=False),
-        hoverinfo='none'
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    fig.update_layout(scene=dict(aspectmode='cube'))
-    return fig
+    Imported lazily: the module pulls in torch/ultralytics/cv2, which is slow and
+    pointless when the user is running against the REST backend. A broken install
+    returns (None, reason) instead of taking the whole sidebar down with it.
+    """
+    try:
+        import detector as det
+    except ImportError as exc:
+        return None, f"无法导入 detector.py：{exc}"
+    try:
+        return det.available_models(), None
+    except Exception as exc:  # corrupt config, unreadable models dir, ...
+        return None, f"本地模型列表读取失败：{exc}"
 
-def phase_space_flow(seed, subject_id, plot_id):
-    """Phase space flow field"""
-    np.random.seed(seed)
-    n = 20
-    x = np.linspace(-3, 3, n)
-    y = np.linspace(-3, 3, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    U = -Y + X * np.sin(phi)
-    V = X + Y * np.cos(psi)
-    
-    # Normalize for better visualization
-    M = np.sqrt(U**2 + V**2)
-    U = U / (M + 0.1)
-    V = V / (M + 0.1)
-    
-    fig = go.Figure()
-    
-    # Background potential
-    Z = np.exp(-0.1 * (X**2 + Y**2)) * np.sin(X * Y + phi)
-    fig.add_trace(go.Heatmap(
-        x=x, y=y, z=Z,
-        colorscale=quantum_colorscale('dream'),
-        showscale=False,
-        opacity=0.5
-    ))
-    
-    # Vector field
-    for i in range(0, n, 2):
-        for j in range(0, n, 2):
-            fig.add_trace(go.Scatter(
-                x=[x[i], x[i] + U[j, i]*0.2],
-                y=[y[j], y[j] + V[j, i]*0.2],
-                mode='lines',
-                line=dict(color='#00ffaa', width=2),
-                hoverinfo='none',
-                showlegend=False
-            ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
 
-def entropy_landscape(seed, subject_id, plot_id):
-    """Entropy/information landscape"""
-    np.random.seed(seed)
-    n = 80
-    x = np.linspace(-3, 3, n)
-    y = np.linspace(-3, 3, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    # Information-theoretic potential
-    R2 = X**2 + Y**2
-    Z = -np.log(np.exp(-R2) + 0.1) + np.sin(X * 2 + phi) * np.cos(Y * 2 + psi)
-    
-    fig = go.Figure(data=[go.Surface(
-        x=X, y=Y, z=Z,
-        colorscale=quantum_colorscale('inferno'),
-        showscale=False,
-        contours=dict(
-            z=dict(show=True, color='#00ffaa', width=1, highlightwidth=2)
-        )
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    fig.update_layout(scene=dict(camera=dict(eye=dict(x=1.5, y=1.5, z=1.2))))
-    return fig
+def load_model_catalogue(backend: str, api_url: str) -> tuple[dict[str, Any], str, str | None]:
+    """
+    Return (catalogue, source, note) for the model drop-down.
 
-def attractor_dynamics(seed, subject_id, plot_id):
-    """Strange attractor dynamics"""
-    np.random.seed(seed)
-    
-    # Lorenz-like system with subject-specific parameters
-    sigma = 10 + subject_id * 0.5
-    rho = 28 + plot_id * 0.3
-    beta = 8/3
-    
-    def lorenz(state, t):
-        x, y, z = state
-        return [
-            sigma * (y - x),
-            x * (rho - z) - y,
-            x * y - beta * z
-        ]
-    
-    t = np.linspace(0, 20, 2000)
-    state0 = [1.0, 1.0, 1.0]
-    states = odeint(lorenz, state0, t)
-    
-    x, y, z = states[:, 0], states[:, 1], states[:, 2]
-    
-    fig = go.Figure(data=[go.Scatter3d(
-        x=x, y=y, z=z,
-        mode='lines',
-        line=dict(
-            color=np.linspace(0, 1, len(x)),
-            colorscale=quantum_colorscale('turbo'),
-            width=2
-        ),
-        hoverinfo='none'
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    fig.update_layout(scene=dict(aspectmode='cube'))
-    return fig
-
-def correlation_matrix_3d(seed, subject_id, plot_id):
-    """3D correlation/covariance structure"""
-    np.random.seed(seed)
-    n = 30
-    
-    # Generate correlation matrix
-    A = np.random.randn(n, n) * (1 + subject_id * 0.1)
-    C = A @ A.T
-    C = C / np.max(np.abs(C))
-    
-    # Add structure
-    for i in range(n):
-        for j in range(n):
-            C[i, j] *= np.exp(-0.1 * abs(i - j) * (1 + 0.1 * plot_id))
-    
-    x, y = np.meshgrid(range(n), range(n))
-    
-    fig = go.Figure(data=[go.Surface(
-        x=x, y=y, z=C,
-        colorscale=quantum_colorscale('plasma'),
-        showscale=False
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def wave_interference(seed, subject_id, plot_id):
-    """Quantum wave interference pattern"""
-    np.random.seed(seed)
-    n = 150
-    x = np.linspace(-5, 5, n)
-    y = np.linspace(-5, 5, n)
-    X, Y = np.meshgrid(x, y)
-    
-    # Multiple wave sources
-    k = 2 * np.pi + subject_id * 0.2
-    sources = [
-        (1 * np.cos(plot_id), 1 * np.sin(plot_id)),
-        (-1 * np.cos(plot_id), -1 * np.sin(plot_id)),
-        (0, 0)
-    ]
-    
-    Z = np.zeros_like(X)
-    for sx, sy in sources:
-        R = np.sqrt((X - sx)**2 + (Y - sy)**2)
-        Z += np.cos(k * R) * np.exp(-0.1 * R)
-    
-    fig = go.Figure(data=go.Heatmap(
-        x=x, y=y, z=Z,
-        colorscale=quantum_colorscale('ice'),
-        showscale=False
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def gradient_flow_3d(seed, subject_id, plot_id):
-    """Gradient descent flow on manifold"""
-    np.random.seed(seed)
-    n = 60
-    x = np.linspace(-2, 2, n)
-    y = np.linspace(-2, 2, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    # Potential surface
-    Z = (X**2 + Y**2) * 0.5 + np.sin(X * 3 + phi) * 0.3 + np.cos(Y * 3 + psi) * 0.3
-    
-    # Gradient computation
-    dZdx = np.gradient(Z, axis=1)
-    dZdy = np.gradient(Z, axis=0)
-    
-    fig = go.Figure()
-    
-    # Surface
-    fig.add_trace(go.Surface(
-        x=X, y=Y, z=Z,
-        colorscale=quantum_colorscale('magma'),
-        showscale=False,
-        opacity=0.8
-    ))
-    
-    # Gradient paths
-    for _ in range(10):
-        x0, y0 = np.random.uniform(-1.5, 1.5, 2)
-        path_x, path_y, path_z = [x0], [y0], []
-        
-        for step in range(50):
-            ix = int((x0 + 2) * n / 4)
-            iy = int((y0 + 2) * n / 4)
-            if 0 <= ix < n and 0 <= iy < n:
-                path_z.append(Z[iy, ix])
-                dx = -dZdx[iy, ix] * 0.05
-                dy = -dZdy[iy, ix] * 0.05
-                x0 += dx
-                y0 += dy
-                path_x.append(x0)
-                path_y.append(y0)
-            else:
-                break
-        
-        if len(path_z) > 2:
-            fig.add_trace(go.Scatter3d(
-                x=path_x, y=path_y, z=path_z,
-                mode='lines',
-                line=dict(color='#00ffaa', width=3),
-                showlegend=False,
-                hoverinfo='none'
-            ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def spherical_harmonics(seed, subject_id, plot_id):
-    """Spherical harmonics visualization"""
-    np.random.seed(seed)
-    
-    l = (subject_id % 5) + 1
-    m = ((plot_id * subject_id) % (2 * l + 1)) - l
-    
-    theta = np.linspace(0, np.pi, 80)
-    phi = np.linspace(0, 2*np.pi, 80)
-    THETA, PHI = np.meshgrid(theta, phi)
-    
-    Y = sph_harm(m, l, PHI, THETA)
-    R = np.abs(Y)
-    
-    X = R * np.sin(THETA) * np.cos(PHI)
-    Y_coord = R * np.sin(THETA) * np.sin(PHI)
-    Z = R * np.cos(THETA)
-    
-    fig = go.Figure(data=[go.Surface(
-        x=X, y=Y_coord, z=Z,
-        surfacecolor=np.angle(Y),
-        colorscale=quantum_colorscale('aurora'),
-        showscale=False
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def tensor_field(seed, subject_id, plot_id):
-    """Tensor field visualization"""
-    np.random.seed(seed)
-    n = 15
-    x = np.linspace(-2, 2, n)
-    y = np.linspace(-2, 2, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    # Tensor components
-    T11 = np.cos(X + phi) * np.sin(Y + psi)
-    T12 = np.sin(X + phi) * np.cos(Y + psi)
-    T22 = np.cos(X * Y + phi + psi)
-    
-    fig = go.Figure()
-    
-    # Background field
-    trace_T = T11 + T22
-    fig.add_trace(go.Heatmap(
-        x=x, y=y, z=trace_T,
-        colorscale=quantum_colorscale('dream'),
-        showscale=False,
-        opacity=0.4
-    ))
-    
-    # Tensor ellipses
-    for i in range(0, n, 2):
-        for j in range(0, n, 2):
-            T = np.array([[T11[j, i], T12[j, i]], [T12[j, i], T22[j, i]]])
-            eigenvalues, eigenvectors = la.eigh(T)
-            
-            angle = np.linspace(0, 2*np.pi, 30)
-            ellipse = eigenvectors @ np.diag(np.abs(eigenvalues)) @ np.array([np.cos(angle), np.sin(angle)])
-            
-            fig.add_trace(go.Scatter(
-                x=x[i] + ellipse[0] * 0.1,
-                y=y[j] + ellipse[1] * 0.1,
-                mode='lines',
-                line=dict(color='#00ffaa', width=1.5),
-                fill='toself',
-                fillcolor='rgba(0, 255, 170, 0.1)',
-                showlegend=False,
-                hoverinfo='none'
-            ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def bifurcation_diagram(seed, subject_id, plot_id):
-    """Bifurcation cascade"""
-    np.random.seed(seed)
-    
-    r_values = np.linspace(2.8 + subject_id * 0.05, 4.0, 300)
-    iterations = 200
-    last_n = 100
-    
-    x = []
-    r = []
-    
-    for r_val in r_values:
-        x_val = 0.1 + np.random.rand() * 0.01
-        for _ in range(iterations):
-            x_val = r_val * x_val * (1 - x_val) * (1 + 0.01 * np.sin(plot_id))
-        
-        for _ in range(last_n):
-            x_val = r_val * x_val * (1 - x_val) * (1 + 0.01 * np.sin(plot_id))
-            x.append(x_val)
-            r.append(r_val)
-    
-    fig = go.Figure(data=go.Scattergl(
-        x=r, y=x,
-        mode='markers',
-        marker=dict(
-            size=0.5,
-            color=x,
-            colorscale=quantum_colorscale('turbo'),
-            showscale=False
-        ),
-        hoverinfo='none'
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    fig.update_xaxes(title_text='Parameter r')
-    fig.update_yaxes(title_text='x')
-    return fig
-
-def quantum_tunneling(seed, subject_id, plot_id):
-    """Quantum tunneling wavefunction"""
-    np.random.seed(seed)
-    x = np.linspace(-5, 5, 200)
-    
-    # Potential barrier
-    V = np.zeros_like(x)
-    barrier_height = 2 + subject_id * 0.1
-    barrier_width = 1 + plot_id * 0.05
-    V[(x > -barrier_width/2) & (x < barrier_width/2)] = barrier_height
-    
-    # Wavefunction (approximate)
-    E = barrier_height * 0.7
-    k1 = np.sqrt(2 * E)
-    k2 = np.sqrt(2 * (barrier_height - E)) if E < barrier_height else 1j * np.sqrt(2 * (E - barrier_height))
-    
-    psi = np.zeros_like(x, dtype=complex)
-    psi[x < -barrier_width/2] = np.exp(1j * k1 * x[x < -barrier_width/2])
-    psi[(x >= -barrier_width/2) & (x <= barrier_width/2)] = np.exp(-np.abs(k2) * x[(x >= -barrier_width/2) & (x <= barrier_width/2)])
-    psi[x > barrier_width/2] = 0.5 * np.exp(1j * k1 * x[x > barrier_width/2])
-    
-    fig = go.Figure()
-    
-    # Potential
-    fig.add_trace(go.Scatter(
-        x=x, y=V,
-        mode='lines',
-        line=dict(color='#ff0066', width=2),
-        name='Potential',
-        fill='tozeroy',
-        fillcolor='rgba(255, 0, 102, 0.2)'
-    ))
-    
-    # Wavefunction
-    fig.add_trace(go.Scatter(
-        x=x, y=np.abs(psi)**2 * 2,
-        mode='lines',
-        line=dict(color='#00ffaa', width=2),
-        name='|ψ|²',
-        fill='tozeroy',
-        fillcolor='rgba(0, 255, 170, 0.2)'
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def fractal_dimension(seed, subject_id, plot_id):
-    """Fractal structure visualization"""
-    np.random.seed(seed)
-    
-    # Julia set variant
-    n = 400
-    x = np.linspace(-2, 2, n)
-    y = np.linspace(-2, 2, n)
-    X, Y = np.meshgrid(x, y)
-    Z = X + 1j * Y
-    
-    c = complex(-0.7 + subject_id * 0.05, 0.27 + plot_id * 0.05)
-    
-    iterations = np.zeros_like(Z, dtype=int)
-    mask = np.ones_like(Z, dtype=bool)
-    
-    for i in range(50):
-        Z[mask] = Z[mask]**2 + c
-        mask = np.abs(Z) < 2
-        iterations[~mask & (iterations == 0)] = i
-    
-    fig = go.Figure(data=go.Heatmap(
-        x=x, y=y, z=iterations,
-        colorscale=quantum_colorscale('turbo'),
-        showscale=False
-    ))
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
-
-def gauge_field(seed, subject_id, plot_id):
-    """Gauge field configuration"""
-    np.random.seed(seed)
-    n = 20
-    x = np.linspace(-2, 2, n)
-    y = np.linspace(-2, 2, n)
-    X, Y = np.meshgrid(x, y)
-    
-    phi = subject_id * 0.314
-    psi = plot_id * 0.271
-    
-    # Gauge potential
-    Ax = Y * np.exp(-(X**2 + Y**2) * 0.5)
-    Ay = -X * np.exp(-(X**2 + Y**2) * 0.5)
-    
-    # Field strength
-    F = np.gradient(Ay, axis=1) - np.gradient(Ax, axis=0)
-    
-    fig = go.Figure()
-    
-    fig.add_trace(go.Heatmap(
-        x=x, y=y, z=F,
-        colorscale=quantum_colorscale('fire'),
-        showscale=False,
-        opacity=0.6
-    ))
-    
-    # Vector field
-    for i in range(0, n, 2):
-        for j in range(0, n, 2):
-            fig.add_annotation(
-                x=x[i], y=y[j],
-                ax=x[i] + Ax[j, i] * 0.3,
-                ay=y[j] + Ay[j, i] * 0.3,
-                xref='x', yref='y',
-                axref='x', ayref='y',
-                showarrow=True,
-                arrowhead=2,
-                arrowsize=1,
-                arrowwidth=2,
-                arrowcolor='#00ffaa'
+    The REST backend is authoritative: it lists what *it* can actually load, which
+    is the process that will run the inference. If it is unreachable we fall back
+    to scanning the local models/ directory so the picker still works.
+    """
+    if backend == REST_BACKEND_LABEL:
+        try:
+            return _cached_remote_catalogue(api_url), MODEL_SOURCE_API, None
+        except Exception as exc:  # backend down, non-JSON reply, ...
+            local, local_note = local_model_catalogue()
+            if local is None:
+                return {}, MODEL_SOURCE_LOCAL, (
+                    f"读取模型列表失败：API 不可用（{exc}）；{local_note}。"
+                )
+            return local, MODEL_SOURCE_LOCAL, (
+                f"API 不可用（{exc}），已改为本地扫描 `models/` 目录。"
             )
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
 
-def eigenspace_projection(seed, subject_id, plot_id):
-    """Eigenspace projection (PCA-like)"""
-    np.random.seed(seed)
-    
-    # Generate high-dimensional data
-    n_samples = 300
-    n_dims = 20
-    
-    # Create structured covariance
-    cov = np.eye(n_dims)
-    for i in range(n_dims):
-        for j in range(n_dims):
-            cov[i, j] = np.exp(-0.5 * abs(i - j)) * np.cos(subject_id * 0.1 * (i + j))
-    
-    data = np.random.multivariate_normal(np.zeros(n_dims), cov, n_samples)
-    
-    # Compute eigenvectors
-    cov_matrix = np.cov(data.T)
-    eigenvalues, eigenvectors = la.eigh(cov_matrix)
-    
-    # Project onto top 3 components
-    idx = np.argsort(eigenvalues)[::-1]
-    top3 = eigenvectors[:, idx[:3]]
-    projected = data @ top3
-    
-    colors = np.sqrt(projected[:, 0]**2 + projected[:, 1]**2 + projected[:, 2]**2)
-    
-    fig = go.Figure(data=[go.Scatter3d(
-        x=projected[:, 0],
-        y=projected[:, 1],
-        z=projected[:, 2],
-        mode='markers',
-        marker=dict(
-            size=3,
-            color=colors,
-            colorscale=quantum_colorscale('quantum'),
-            showscale=False,
-            opacity=0.7
-        ),
-        hoverinfo='none'
-    )])
-    
-    fig.update_layout(**create_dark_layout())
-    return fig
+    local, local_note = local_model_catalogue()
+    if local is None:
+        return {}, MODEL_SOURCE_LOCAL, f"读取模型列表失败：{local_note}。"
+    return local, MODEL_SOURCE_LOCAL, None
 
-# ============================================================
-# SUBJECT DEFINITIONS
-# ============================================================
 
-SUBJECTS = {
-    'Reinforcement Learning': {
-        'icon': '🎮',
-        'plots': [
-            ('Q-Value Landscape', manifold_3d, 'viridis'),
-            ('Policy Gradient Flow', phase_space_flow, None),
-            ('Value Function Surface', entropy_landscape, None),
-            ('State-Action Space', quantum_field_2d, 'plasma'),
-            ('Reward Manifold', manifold_3d, 'turbo'),
-            ('Bellman Error Field', wave_interference, None),
-            ('Advantage Function', gradient_flow_3d, None),
-            ('Experience Replay Network', topology_network, None),
-            ('Temporal Difference', correlation_matrix_3d, None),
-            ('Actor-Critic Dynamics', attractor_dynamics, None),
-            ('Exploration Landscape', entropy_landscape, None),
-            ('Multi-Agent Topology', topology_network, None),
-            ('Return Distribution', bifurcation_diagram, None),
-            ('Credit Assignment', tensor_field, None),
-            ('Eigenoptions', eigenspace_projection, None),
-            ('Meta-Learning Manifold', manifold_3d, 'quantum'),
-        ]
-    },
-    
-    'Artificial General Intelligence': {
-        'icon': '🧠',
-        'plots': [
-            ('AGI Capability Manifold', manifold_3d, 'dream'),
-            ('Cognitive Architecture', topology_network, None),
-            ('Transfer Learning Field', quantum_field_2d, 'aurora'),
-            ('Multi-Task Gradient', gradient_flow_3d, None),
-            ('World Model Latent Space', eigenspace_projection, None),
-            ('Reasoning Dynamics', attractor_dynamics, None),
-            ('Knowledge Graph Topology', topology_network, None),
-            ('Abstraction Hierarchy', entropy_landscape, None),
-            ('Meta-Cognition Surface', manifold_3d, 'magma'),
-            ('Goal Alignment Field', phase_space_flow, None),
-            ('Causal Discovery Network', topology_network, None),
-            ('Attention Manifold', correlation_matrix_3d, None),
-            ('Planning Landscape', wave_interference, None),
-            ('Few-Shot Learning', bifurcation_diagram, None),
-            ('Emergent Behavior', fractal_dimension, None),
-            ('Universal Intelligence', manifold_3d, 'turbo'),
-        ]
-    },
-    
-    'Quantum Physics': {
-        'icon': '⚛️',
-        'plots': [
-            ('Wavefunction Manifold', manifold_3d, 'quantum'),
-            ('Quantum Superposition', wave_interference, None),
-            ('Hilbert Space Projection', eigenspace_projection, None),
-            ('Energy Eigenstate', spherical_harmonics, None),
-            ('Quantum Tunneling', quantum_tunneling, None),
-            ('Entanglement Entropy', entropy_landscape, None),
-            ('Phase Space Density', phase_space_flow, None),
-            ('Observable Operator', tensor_field, None),
-            ('Coherence Landscape', quantum_field_2d, 'ice'),
-            ('Decoherence Dynamics', attractor_dynamics, None),
-            ('Quantum Chaos', bifurcation_diagram, None),
-            ('Measurement Manifold', manifold_3d, 'plasma'),
-            ('Spin Network', topology_network, None),
-            ('Quantum Correlations', correlation_matrix_3d, None),
-            ('Uncertainty Surface', entropy_landscape, None),
-            ('Many-Body State', fractal_dimension, None),
-        ]
-    },
-    
-    'Topology': {
-        'icon': '🔗',
-        'plots': [
-            ('Topological Manifold', manifold_3d, 'turbo'),
-            ('Homology Groups', topology_network, None),
-            ('Betti Number Flow', phase_space_flow, None),
-            ('Persistent Homology', bifurcation_diagram, None),
-            ('Simplicial Complex', topology_network, None),
-            ('Morse Theory Landscape', entropy_landscape, None),
-            ('Fiber Bundle', gradient_flow_3d, None),
-            ('Knot Invariant', attractor_dynamics, None),
-            ('Homotopy Groups', quantum_field_2d, 'aurora'),
-            ('Manifold Curvature', tensor_field, None),
-            ('Topological Defects', wave_interference, None),
-            ('Cobordism Class', manifold_3d, 'dream'),
-            ('Euler Characteristic', correlation_matrix_3d, None),
-            ('Genus Landscape', entropy_landscape, None),
-            ('Bundle Connection', gauge_field, None),
-            ('Characteristic Classes', eigenspace_projection, None),
-        ]
-    },
-    
-    'Quantum Gravity': {
-        'icon': '🌌',
-        'plots': [
-            ('Spacetime Foam', fractal_dimension, None),
-            ('Loop Quantum Gravity', topology_network, None),
-            ('Holographic Principle', quantum_field_2d, 'inferno'),
-            ('AdS/CFT Duality', manifold_3d, 'quantum'),
-            ('String Theory Manifold', manifold_3d, 'dream'),
-            ('Graviton Field', gauge_field, None),
-            ('Black Hole Entropy', entropy_landscape, None),
-            ('Hawking Radiation', wave_interference, None),
-            ('Quantum Geometry', tensor_field, None),
-            ('Spin Foam', topology_network, None),
-            ('Causal Set', topology_network, None),
-            ('Wheeler-DeWitt', quantum_tunneling, None),
-            ('Planck Scale', bifurcation_diagram, None),
-            ('Emergent Spacetime', eigenspace_projection, None),
-            ('Gravitational Waves', attractor_dynamics, None),
-            ('Cosmological Constant', manifold_3d, 'fire'),
-        ]
-    },
-    
-    'Stigmergy': {
-        'icon': '🐜',
-        'plots': [
-            ('Pheromone Field', quantum_field_2d, 'turbo'),
-            ('Swarm Intelligence', topology_network, None),
-            ('Collective Behavior', attractor_dynamics, None),
-            ('Emergence Landscape', entropy_landscape, None),
-            ('Self-Organization', bifurcation_diagram, None),
-            ('Coordination Network', topology_network, None),
-            ('Trail Formation', gradient_flow_3d, None),
-            ('Distributed Decision', phase_space_flow, None),
-            ('Colony Dynamics', manifold_3d, 'plasma'),
-            ('Information Flow', wave_interference, None),
-            ('Adaptive Network', topology_network, None),
-            ('Feedback Loops', correlation_matrix_3d, None),
-            ('Quorum Sensing', quantum_field_2d, 'aurora'),
-            ('Pattern Formation', fractal_dimension, None),
-            ('Decentralized Control', tensor_field, None),
-            ('Collective Memory', manifold_3d, 'quantum'),
-        ]
-    },
-    
-    'Neural Networks': {
-        'icon': '🕸️',
-        'plots': [
-            ('Loss Landscape', manifold_3d, 'viridis'),
-            ('Gradient Flow', gradient_flow_3d, None),
-            ('Neural Tangent Kernel', quantum_field_2d, 'plasma'),
-            ('Activation Manifold', eigenspace_projection, None),
-            ('Weight Space Topology', topology_network, None),
-            ('Optimization Dynamics', attractor_dynamics, None),
-            ('Feature Space', correlation_matrix_3d, None),
-            ('Attention Mechanism', tensor_field, None),
-            ('Dropout Stochasticity', bifurcation_diagram, None),
-            ('Batch Normalization', phase_space_flow, None),
-            ('Residual Connections', wave_interference, None),
-            ('Embedding Space', eigenspace_projection, None),
-            ('Learned Representations', manifold_3d, 'dream'),
-            ('Adversarial Landscape', entropy_landscape, None),
-            ('Neural Architecture', topology_network, None),
-            ('Generalization Surface', manifold_3d, 'turbo'),
-        ]
-    },
-    
-    'Chaos Theory': {
-        'icon': '🌀',
-        'plots': [
-            ('Strange Attractor', attractor_dynamics, None),
-            ('Bifurcation Cascade', bifurcation_diagram, None),
-            ('Lyapunov Exponent', quantum_field_2d, 'fire'),
-            ('Phase Space', phase_space_flow, None),
-            ('Poincaré Section', wave_interference, None),
-            ('Fractal Basin', fractal_dimension, None),
-            ('Chaos Manifold', manifold_3d, 'turbo'),
-            ('Sensitivity Field', entropy_landscape, None),
-            ('Attractor Network', topology_network, None),
-            ('Ergodic Flow', gradient_flow_3d, None),
-            ('Mixing Dynamics', correlation_matrix_3d, None),
-            ('Period Doubling', bifurcation_diagram, None),
-            ('Nonlinear Resonance', wave_interference, None),
-            ('Turbulent Flow', manifold_3d, 'plasma'),
-            ('Control Landscape', quantum_field_2d, 'dream'),
-            ('Synchronization', attractor_dynamics, None),
-        ]
-    },
-    
-    'String Theory': {
-        'icon': '🎻',
-        'plots': [
-            ('Calabi-Yau Manifold', manifold_3d, 'quantum'),
-            ('Compactification', topology_network, None),
-            ('D-Brane Configuration', quantum_field_2d, 'aurora'),
-            ('Moduli Space', eigenspace_projection, None),
-            ('String Worldsheet', manifold_3d, 'dream'),
-            ('Extra Dimensions', tensor_field, None),
-            ('Mirror Symmetry', wave_interference, None),
-            ('Supersymmetry', correlation_matrix_3d, None),
-            ('M-Theory Landscape', entropy_landscape, None),
-            ('Dualities Network', topology_network, None),
-            ('Flux Compactification', gauge_field, None),
-            ('Vacuum Manifold', manifold_3d, 'inferno'),
-            ('Partition Function', quantum_field_2d, 'turbo'),
-            ('Wilson Loops', attractor_dynamics, None),
-            ('Heterotic String', bifurcation_diagram, None),
-            ('Brane Dynamics', gradient_flow_3d, None),
-        ]
-    },
-    
-    'Information Theory': {
-        'icon': '📡',
-        'plots': [
-            ('Shannon Entropy', entropy_landscape, None),
-            ('Mutual Information', correlation_matrix_3d, None),
-            ('Channel Capacity', quantum_field_2d, 'viridis'),
-            ('Source Coding', bifurcation_diagram, None),
-            ('Rate Distortion', manifold_3d, 'plasma'),
-            ('Information Flow', phase_space_flow, None),
-            ('Kolmogorov Complexity', fractal_dimension, None),
-            ('Error Correction', topology_network, None),
-            ('Fisher Information', tensor_field, None),
-            ('Entropy Production', wave_interference, None),
-            ('Data Compression', gradient_flow_3d, None),
-            ('Algorithmic Information', entropy_landscape, None),
-            ('Information Geometry', manifold_3d, 'quantum'),
-            ('Coding Network', topology_network, None),
-            ('Channel Noise', quantum_field_2d, 'ice'),
-            ('Information Bottleneck', attractor_dynamics, None),
-        ]
-    },
-    
-    'Complex Systems': {
-        'icon': '🔮',
-        'plots': [
-            ('Emergence Landscape', entropy_landscape, None),
-            ('Network Dynamics', topology_network, None),
-            ('Critical Phenomena', bifurcation_diagram, None),
-            ('Self-Organization', manifold_3d, 'turbo'),
-            ('Scale-Free Network', topology_network, None),
-            ('Phase Transition', quantum_field_2d, 'fire'),
-            ('Collective Behavior', attractor_dynamics, None),
-            ('Complexity Measure', fractal_dimension, None),
-            ('Adaptive System', gradient_flow_3d, None),
-            ('Percolation Network', topology_network, None),
-            ('Criticality Surface', manifold_3d, 'plasma'),
-            ('Feedback Dynamics', phase_space_flow, None),
-            ('Pattern Formation', wave_interference, None),
-            ('Hierarchical Structure', eigenspace_projection, None),
-            ('Resilience Landscape', entropy_landscape, None),
-            ('Network Topology', correlation_matrix_3d, None),
-        ]
-    },
-    
-    'Manifold Learning': {
-        'icon': '🗺️',
-        'plots': [
-            ('Riemannian Manifold', manifold_3d, 'dream'),
-            ('Geodesic Flow', gradient_flow_3d, None),
-            ('Tangent Space', eigenspace_projection, None),
-            ('Curvature Tensor', tensor_field, None),
-            ('Dimensionality Reduction', correlation_matrix_3d, None),
-            ('Metric Tensor', quantum_field_2d, 'quantum'),
-            ('Parallel Transport', gauge_field, None),
-            ('Embedding Space', manifold_3d, 'aurora'),
-            ('Local Coordinates', phase_space_flow, None),
-            ('Differential Form', wave_interference, None),
-            ('Manifold Atlas', topology_network, None),
-            ('Connection Form', tensor_field, None),
-            ('Isometric Embedding', eigenspace_projection, None),
-            ('Laplacian Eigenmap', correlation_matrix_3d, None),
-            ('Diffusion Map', quantum_field_2d, 'turbo'),
-            ('UMAP Projection', manifold_3d, 'viridis'),
-        ]
-    },
-    
-    'Category Theory': {
-        'icon': '📐',
-        'plots': [
-            ('Functor Mapping', topology_network, None),
-            ('Natural Transformation', gradient_flow_3d, None),
-            ('Categorical Diagram', topology_network, None),
-            ('Adjunction Landscape', manifold_3d, 'quantum'),
-            ('Topos Structure', eigenspace_projection, None),
-            ('Monoidal Category', tensor_field, None),
-            ('Yoneda Lemma', wave_interference, None),
-            ('Categorical Limit', entropy_landscape, None),
-            ('Sheaf Theory', quantum_field_2d, 'dream'),
-            ('Higher Category', topology_network, None),
-            ('Commutative Diagram', correlation_matrix_3d, None),
-            ('Universal Property', manifold_3d, 'plasma'),
-            ('Categorical Product', phase_space_flow, None),
-            ('Equalizer Diagram', bifurcation_diagram, None),
-            ('Enriched Category', manifold_3d, 'aurora'),
-            ('Kan Extension', gradient_flow_3d, None),
-        ]
-    },
-    
-    'Quantum Computing': {
-        'icon': '🔬',
-        'plots': [
-            ('Qubit State Space', quantum_field_2d, 'quantum'),
-            ('Quantum Circuit', topology_network, None),
-            ('Gate Fidelity', manifold_3d, 'ice'),
-            ('Entanglement Network', topology_network, None),
-            ('Quantum Algorithm', gradient_flow_3d, None),
-            ('Error Correction Code', correlation_matrix_3d, None),
-            ('Quantum Supremacy', entropy_landscape, None),
-            ('Bloch Sphere', spherical_harmonics, None),
-            ('Quantum Annealing', attractor_dynamics, None),
-            ('QAOA Landscape', manifold_3d, 'viridis'),
-            ('Variational Circuit', phase_space_flow, None),
-            ('Quantum Channels', tensor_field, None),
-            ('Measurement Basis', eigenspace_projection, None),
-            ('Quantum Volume', quantum_field_2d, 'aurora'),
-            ('Decoherence Rate', bifurcation_diagram, None),
-            ('Quantum Advantage', manifold_3d, 'turbo'),
-        ]
-    },
-    
-    'Optimization Theory': {
-        'icon': '📈',
-        'plots': [
-            ('Optimization Landscape', manifold_3d, 'viridis'),
-            ('Gradient Descent', gradient_flow_3d, None),
-            ('Convex Envelope', entropy_landscape, None),
-            ('Lagrange Multiplier', quantum_field_2d, 'plasma'),
-            ('Pareto Frontier', manifold_3d, 'dream'),
-            ('Dual Problem', eigenspace_projection, None),
-            ('Constraint Surface', tensor_field, None),
-            ('KKT Conditions', phase_space_flow, None),
-            ('Global Optimum', wave_interference, None),
-            ('Convergence Dynamics', attractor_dynamics, None),
-            ('Saddle Point', bifurcation_diagram, None),
-            ('Barrier Method', quantum_field_2d, 'fire'),
-            ('Trust Region', manifold_3d, 'quantum'),
-            ('Line Search', gradient_flow_3d, None),
-            ('Feasible Region', entropy_landscape, None),
-            ('Objective Function', manifold_3d, 'turbo'),
-        ]
-    },
-    
-    'Statistical Mechanics': {
-        'icon': '♨️',
-        'plots': [
-            ('Partition Function', entropy_landscape, None),
-            ('Phase Diagram', quantum_field_2d, 'fire'),
-            ('Free Energy', manifold_3d, 'inferno'),
-            ('Correlation Function', correlation_matrix_3d, None),
-            ('Ising Model', wave_interference, None),
-            ('Critical Point', bifurcation_diagram, None),
-            ('Boltzmann Distribution', gradient_flow_3d, None),
-            ('Gibbs Ensemble', eigenspace_projection, None),
-            ('Monte Carlo', attractor_dynamics, None),
-            ('Spin Configuration', quantum_field_2d, 'quantum'),
-            ('Thermodynamic Limit', manifold_3d, 'plasma'),
-            ('Phase Transition', entropy_landscape, None),
-            ('Order Parameter', phase_space_flow, None),
-            ('Fluctuations', bifurcation_diagram, None),
-            ('Entropy Landscape', entropy_landscape, None),
-            ('Mean Field', tensor_field, None),
-        ]
-    },
-    
-    'Gauge Theory': {
-        'icon': '🌊',
-        'plots': [
-            ('Yang-Mills Field', gauge_field, None),
-            ('Gauge Transformation', gradient_flow_3d, None),
-            ('Field Strength', quantum_field_2d, 'aurora'),
-            ('Gauge Group', topology_network, None),
-            ('Chern-Simons', manifold_3d, 'dream'),
-            ('Instantons', wave_interference, None),
-            ('Gauge Invariance', tensor_field, None),
-            ('Connection Form', gauge_field, None),
-            ('Curvature Form', quantum_field_2d, 'turbo'),
-            ('Wilson Loop', attractor_dynamics, None),
-            ('t Hooft Loop', topology_network, None),
-            ('Monopole Field', manifold_3d, 'quantum'),
-            ('Gauge Fixing', phase_space_flow, None),
-            ('BRST Symmetry', eigenspace_projection, None),
-            ('Lattice Gauge', correlation_matrix_3d, None),
-            ('Gauge Anomaly', entropy_landscape, None),
-        ]
-    },
-    
-    'Differential Geometry': {
-        'icon': '📏',
-        'plots': [
-            ('Gaussian Curvature', manifold_3d, 'quantum'),
-            ('Geodesic Equation', gradient_flow_3d, None),
-            ('Riemann Tensor', tensor_field, None),
-            ('Christoffel Symbols', quantum_field_2d, 'dream'),
-            ('Parallel Transport', gauge_field, None),
-            ('Lie Derivative', phase_space_flow, None),
-            ('Exterior Derivative', wave_interference, None),
-            ('Metric Tensor', tensor_field, None),
-            ('Killing Vector', gradient_flow_3d, None),
-            ('Sectional Curvature', manifold_3d, 'plasma'),
-            ('Ricci Flow', attractor_dynamics, None),
-            ('Connection Form', gauge_field, None),
-            ('Holonomy Group', topology_network, None),
-            ('Gauss-Bonnet', entropy_landscape, None),
-            ('Symplectic Form', quantum_field_2d, 'aurora'),
-            ('Complex Manifold', eigenspace_projection, None),
-        ]
-    },
-    
-    'Network Science': {
-        'icon': '🕸️',
-        'plots': [
-            ('Network Topology', topology_network, None),
-            ('Centrality Measure', quantum_field_2d, 'viridis'),
-            ('Community Structure', eigenspace_projection, None),
-            ('Scale-Free', topology_network, None),
-            ('Small World', topology_network, None),
-            ('Degree Distribution', bifurcation_diagram, None),
-            ('Clustering Coefficient', correlation_matrix_3d, None),
-            ('Network Flow', phase_space_flow, None),
-            ('Modularity', entropy_landscape, None),
-            ('Percolation', quantum_field_2d, 'fire'),
-            ('Network Motif', topology_network, None),
-            ('PageRank', gradient_flow_3d, None),
-            ('Epidemic Spread', wave_interference, None),
-            ('Structural Balance', tensor_field, None),
-            ('Link Prediction', manifold_3d, 'quantum'),
-            ('Network Resilience', attractor_dynamics, None),
-        ]
-    },
-    
-    'Dynamical Systems': {
-        'icon': '⚙️',
-        'plots': [
-            ('Phase Portrait', phase_space_flow, None),
-            ('Poincaré Map', wave_interference, None),
-            ('Limit Cycle', attractor_dynamics, None),
-            ('Bifurcation', bifurcation_diagram, None),
-            ('Stable Manifold', manifold_3d, 'turbo'),
-            ('Basin of Attraction', quantum_field_2d, 'plasma'),
-            ('Lyapunov Function', entropy_landscape, None),
-            ('Hopf Bifurcation', gradient_flow_3d, None),
-            ('Hamiltonian Flow', phase_space_flow, None),
-            ('Period Doubling', bifurcation_diagram, None),
-            ('Center Manifold', eigenspace_projection, None),
-            ('Poincaré-Bendixson', wave_interference, None),
-            ('Floquet Theory', correlation_matrix_3d, None),
-            ('Normal Form', tensor_field, None),
-            ('Invariant Torus', manifold_3d, 'quantum'),
-            ('Ergodic Theory', attractor_dynamics, None),
-        ]
-    },
-    
-    'Quantum Field Theory': {
-        'icon': '🌊',
-        'plots': [
-            ('Feynman Path', attractor_dynamics, None),
-            ('Vacuum Energy', entropy_landscape, None),
-            ('Propagator', quantum_field_2d, 'quantum'),
-            ('Renormalization Flow', gradient_flow_3d, None),
-            ('Field Configuration', manifold_3d, 'dream'),
-            ('Scattering Amplitude', wave_interference, None),
-            ('Loop Diagram', topology_network, None),
-            ('Beta Function', bifurcation_diagram, None),
-            ('Effective Action', entropy_landscape, None),
-            ('Ward Identity', tensor_field, None),
-            ('Anomaly Field', quantum_field_2d, 'aurora'),
-            ('Instanton', manifold_3d, 'inferno'),
-            ('Soliton Solution', quantum_tunneling, None),
-            ('Correlation Function', correlation_matrix_3d, None),
-            ('Conformal Field', manifold_3d, 'turbo'),
-            ('Quantum Anomaly', phase_space_flow, None),
-        ]
+def order_models(catalogue: dict[str, Any]) -> list[str]:
+    """
+    Build the drop-down contents: custom weights first, then builtin aliases.
+
+    Custom names win on collision with an alias, because resolve_model_ref() gives
+    a file in models/ priority too -- so what the user picks is what gets loaded.
+    """
+    custom = [name for name in catalogue.get("custom") or [] if name]
+    if not custom:
+        custom = sorted(
+            name
+            for name in (catalogue.get("downloaded") or [])
+            if isinstance(name, str) and name.endswith(".pt")
+        )
+    builtin = [name for name in catalogue.get("builtin") or [] if name]
+
+    ordered: list[str] = []
+    for name in [*custom, *builtin]:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered or list(FALLBACK_MODEL_ALIASES)
+
+
+def api_health(api_url: str) -> dict[str, Any]:
+    response = requests.get(f"{api_url.rstrip('/')}/health", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def api_warmup(api_url: str, model: str, device: str) -> dict[str, Any]:
+    response = requests.post(
+        f"{api_url.rstrip('/')}/warmup",
+        params={"model": model, "device": device},
+        timeout=600,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def detect_via_api(
+    api_url: str,
+    data: bytes,
+    filename: str,
+    model: str,
+    confidence: float,
+    iou: float,
+    device: str,
+    image_format: str,
+    max_size: int,
+) -> dict[str, Any]:
+    files = {"file": (filename, data, "application/octet-stream")}
+    form = {
+        "model": model,
+        "confidence": str(confidence),
+        "iou": str(iou),
+        "device": device,
+        "image_format": image_format,
+        "max_size": str(max_size),
+        "include_image": "true",
     }
+    try:
+        response = requests.post(
+            f"{api_url.rstrip('/')}/detect", files=files, data=form, timeout=600
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise BackendError(
+            f"无法连接位于 {api_url} 的 API 服务。请先启动它：\n\n"
+            f"    Windows 一键启动：双击项目根目录的「一键启动.bat」\n"
+            f"    手动启动：uvicorn api:app --reload --port 8000\n\n"
+            f"或在侧边栏把“推理后端”切换为“{LOCAL_BACKEND_LABEL}”。"
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise BackendError("API 处理这张图片时超时。") from exc
+
+    if response.status_code != 200:
+        detail = response.text
+        try:
+            detail = response.json().get("detail", detail)
+        except ValueError:
+            pass
+        raise BackendError(f"API 返回状态码 {response.status_code}：{detail}")
+    return response.json()
+
+
+def detect_locally(
+    data: bytes,
+    model: str,
+    confidence: float,
+    iou: float,
+    device: str,
+    max_size: int,
+) -> dict[str, Any]:
+    try:
+        import detector as det
+    except ImportError as exc:  # ultralytics / torch not installed
+        raise BackendError(
+            f"本地推理需要先安装检测相关依赖（{exc}）。"
+        ) from exc
+
+    try:
+        image = det.decode_image(data)
+    except ValueError as exc:
+        raise BackendError(str(exc)) from exc
+
+    started = time.perf_counter()
+    try:
+        payload = det.detect(
+            image,
+            model=model,
+            confidence=confidence,
+            iou=iou,
+            device=device,
+            max_size=max_size,
+            annotate=True,
+            image_format="jpeg",
+        )
+    except (det.ModelError, ValueError) as exc:
+        raise BackendError(str(exc)) from exc
+
+    payload["success"] = True
+    payload["total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    payload["summary"] = det.summarise(payload["detections"])
+    return payload
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def fetch_image_url(url: str) -> tuple[bytes, str]:
+    """Download a user-supplied image URL, with scheme and size guards."""
+    url = url.strip()
+    if not url:
+        raise BackendError("请先输入图片 URL。")
+    if not url.lower().startswith(("http://", "https://")):
+        raise BackendError("仅支持以 http:// 或 https:// 开头的 URL。")
+    try:
+        response = requests.get(url, timeout=30, stream=True)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise BackendError(f"无法下载该 URL：{exc}") from exc
+
+    declared = response.headers.get("Content-Type", "")
+    if declared and not declared.lower().startswith("image/"):
+        raise BackendError(f"该 URL 指向的不是图片（Content-Type：{declared}）。")
+
+    payload = response.content
+    if not payload:
+        raise BackendError("该 URL 返回了空响应。")
+    if len(payload) > URL_MAX_MB * 1024 * 1024:
+        raise BackendError(f"该图片超过 {URL_MAX_MB:.0f} MB 上限。")
+    filename = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded-image"
+    return payload, filename
+
+
+def data_uri_to_bytes(uri: str) -> bytes:
+    return base64.b64decode(uri.split(",", 1)[1])
+
+
+def summary_dataframe(summary: list[dict[str, Any]]) -> pd.DataFrame:
+    frame = pd.DataFrame(summary)
+    return frame.rename(
+        columns={
+            "class": "类别",
+            "count": "数量",
+            "mean_confidence": "平均置信度",
+            "max_confidence": "最高置信度",
+            "boxes": "检测框 (x1,y1,x2,y2)",
+        }
+    )
+
+
+def detections_dataframe(detections: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for index, det in enumerate(detections, start=1):
+        box = det["box"]
+        rows.append(
+            {
+                "#": index,
+                "类别": det["class_name"],
+                "置信度": det["confidence"],
+                "x1": box["x1"],
+                "y1": box["y1"],
+                "x2": box["x2"],
+                "y2": box["y2"],
+                "宽度": box["width"],
+                "高度": box["height"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_detection(data: bytes, filename: str, settings: dict[str, Any]) -> None:
+    """Execute detection with the configured backend and store the result."""
+    try:
+        if settings["backend"] == REST_BACKEND_LABEL:
+            result = detect_via_api(
+                settings["api_url"], data, filename,
+                settings["model"], settings["confidence"], settings["iou"],
+                settings["device"], settings["image_format"], settings["max_size"],
+            )
+        else:
+            result = detect_locally(
+                data, settings["model"], settings["confidence"], settings["iou"],
+                settings["device"], settings["max_size"],
+            )
+    except BackendError as exc:
+        st.session_state.pop("result", None)
+        st.error(str(exc))
+        return
+
+    st.session_state["result"] = result
+    st.session_state["source_bytes"] = data
+    st.session_state["source_name"] = filename
+    st.session_state["settings_used"] = settings
+
+
+def render_results() -> None:
+    result = st.session_state.get("result")
+    if not result:
+        return
+
+    st.divider()
+    st.subheader("检测结果")
+
+    metrics = st.columns(4)
+    metrics[0].metric("目标数量", result["count"])
+    metrics[1].metric("类别数量", len(result["counts_by_class"]))
+    metrics[2].metric("推理耗时", f"{result['inference_ms']:.0f} ms")
+    metrics[3].metric("总耗时", f"{result.get('total_ms', 0):.0f} ms")
+
+    st.caption(
+        f"模型 **{result['model']}**，运行于 **{result['device']}** · "
+        f"置信度 ≥ {result['confidence_threshold']} · IoU {result['iou_threshold']} · "
+        f"源图尺寸 {result['image']['width']}×{result['image']['height']} 像素"
+    )
+
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        if result.get("annotated_image"):
+            st.image(
+                data_uri_to_bytes(result["annotated_image"]),
+                caption=f"标注结果 · {st.session_state.get('source_name', 'image')}",
+                width="stretch",
+            )
+        else:
+            st.info("未返回标注图片。")
+    with right:
+        if not result["detections"]:
+            st.warning(
+                "没有目标达到置信度阈值。可以尝试调低置信度滑块，"
+                "或改用更大的模型。"
+            )
+        else:
+            summary = summary_dataframe(result["summary"])
+            st.markdown("**按类别汇总**")
+            st.dataframe(summary, width="stretch", hide_index=True)
+            st.markdown("**各类别目标数量**")
+            st.bar_chart(
+                summary[["类别", "数量"]],
+                x="类别",
+                y="数量",
+                horizontal=True,
+                color="#00d4aa",
+            )
+
+    if result["detections"]:
+        with st.expander(f"全部检测结果（{result['count']} 个）", expanded=False):
+            st.dataframe(
+                detections_dataframe(result["detections"]), width="stretch", hide_index=True
+            )
+
+    st.markdown("**导出**")
+    downloads = st.columns(4)
+    stem = os.path.splitext(st.session_state.get("source_name", "image"))[0]
+    downloads[0].download_button(
+        "检测明细 CSV",
+        detections_csv_bytes(result["detections"]),
+        file_name=f"{stem}_detections.csv",
+        mime="text/csv",
+    )
+    downloads[1].download_button(
+        "类别汇总 CSV",
+        summary_dataframe(result["summary"]).to_csv(index=False).encode("utf-8"),
+        file_name=f"{stem}_summary.csv",
+        mime="text/csv",
+    )
+    downloads[2].download_button(
+        "完整 JSON",
+        json.dumps(
+            {k: v for k, v in result.items() if k != "annotated_image"}, indent=2
+        ).encode("utf-8"),
+        file_name=f"{stem}_detections.json",
+        mime="application/json",
+    )
+    if result.get("annotated_image"):
+        extension = "png" if result["annotated_image"].startswith("data:image/png") else "jpg"
+        downloads[3].download_button(
+            "标注图片",
+            data_uri_to_bytes(result["annotated_image"]),
+            file_name=f"{stem}_annotated.{extension}",
+            mime=f"image/{'png' if extension == 'png' else 'jpeg'}",
+        )
+
+
+def detections_csv_bytes(detections: list[dict[str, Any]]) -> bytes:
+    try:
+        import detector as det
+
+        return det.detections_csv(detections).encode("utf-8")
+    except ImportError:
+        return detections_dataframe(detections).to_csv(index=False).encode("utf-8")
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("⚙️ 设置")
+
+backend = st.sidebar.radio(
+    "推理后端",
+    BACKEND_OPTIONS,
+    help="REST API 通过 HTTP 调用 api.py；本地推理则在 Streamlit 进程内直接运行模型。",
+)
+api_url = DEFAULT_API_URL
+if backend == REST_BACKEND_LABEL:
+    api_url = st.sidebar.text_input("API 地址", value=DEFAULT_API_URL)
+
+# The model list is discovered, never hardcoded: builtin aliases come from the
+# backend, and every *.pt in its models/ directory is appended. A click on
+# "刷新模型列表" drops the cache so a freshly copied weight appears immediately.
+if st.session_state.pop("refresh_models", False):
+    _cached_remote_catalogue.clear()
+
+catalogue, catalogue_source, catalogue_note = load_model_catalogue(backend, api_url)
+model_options = order_models(catalogue)
+custom_models = [name for name in (catalogue.get("custom") or []) if name]
+
+header_left, header_right = st.sidebar.columns([3, 2])
+header_left.markdown("**模型**")
+with header_right:
+    # A zero-height spacer nudges the button down so it lines up with the label.
+    st.write("")
+    if st.button(
+        "🔄 刷新",
+        key="refresh_models_btn",
+        help="重新扫描 models/ 目录并重新读取后端模型列表",
+    ):
+        st.session_state["refresh_models"] = True
+        st.rerun()
+
+model = st.sidebar.selectbox(
+    "模型",
+    model_options,
+    index=0,
+    label_visibility="collapsed",
+    help=(
+        "带 `.pt` 后缀的是 `models/` 目录里的自定义权重（已排在列表最前面）；"
+        "其余为内置别名，首次使用时自动下载。n 速度最快、l/x 精度最高。"
+    ),
+)
+
+model_status = f"共 {len(model_options)} 个可选模型"
+if custom_models:
+    model_status += f"，其中 {len(custom_models)} 个来自 `models/`"
+model_status += f"（来源：{catalogue_source}）"
+st.sidebar.caption(model_status)
+
+if backend == REST_BACKEND_LABEL:
+    st.sidebar.caption("📂 自定义权重的存放目录：`models/`（可用 `MODELS_DIR` 环境变量修改）。")
+else:
+    try:
+        import detector as _det
+
+        st.sidebar.caption(f"📂 自定义权重的存放目录：`{_det.MODELS_DIR}`")
+    except ImportError:
+        pass
+
+if catalogue_note:
+    st.sidebar.warning(catalogue_note)
+elif not custom_models:
+    if backend == REST_BACKEND_LABEL:
+        st.sidebar.info(
+            "还没有自定义权重。把 `.pt` 复制到后端的 `models/` 目录，"
+            "或在这里上传，然后点「🔄 刷新」即可选用。"
+        )
+    else:
+        st.sidebar.info(
+            "还没有自定义权重。把 `.pt` 复制到上面的 `models/` 目录，然后点「🔄 刷新」即可选用。"
+        )
+
+if backend == REST_BACKEND_LABEL:
+    with st.sidebar.expander("📤 上传自定义权重（.pt）", expanded=False):
+        uploaded_model = st.file_uploader("选择 .pt 权重文件", type=["pt"], key="model_upload")
+        if uploaded_model is not None and st.button("安装到 models/", key="model_upload_btn"):
+            try:
+                info = api_upload_model(api_url, uploaded_model.name, uploaded_model.getvalue())
+            except BackendError as exc:
+                st.error(str(exc))
+            except requests.exceptions.RequestException as exc:
+                st.error(f"无法连接 API：{exc}")
+            else:
+                _cached_remote_catalogue.clear()
+                st.session_state["refresh_models"] = True
+                # Drop the uploaded bytes from the widget before rerunning, or the
+                # file would still be staged and the install would look repeatable.
+                st.session_state.pop("model_upload", None)
+                st.success(f"已安装 `{info.get('model', uploaded_model.name)}`，正在刷新列表…")
+                st.rerun()
+        st.caption(
+            "上传的权重会写入后端的 `models/` 目录并出现在下拉框中。"
+            "`.pt` 文件本质上是 pickle，请只安装你信任的模型。"
+        )
+
+confidence = st.sidebar.slider("置信度阈值", 0.10, 0.90, 0.50, 0.05)
+iou = st.sidebar.slider("NMS IoU 阈值", 0.10, 0.90, 0.45, 0.05)
+device = st.sidebar.selectbox("运行设备", ["auto", "cpu", "cuda:0", "mps"], index=0)
+max_size = st.sidebar.select_slider(
+    "最大推理尺寸（像素）", options=[640, 960, 1280, 1600, 1920, 2560], value=1280,
+    help="推理前会把长边缩放到该尺寸；检测框仍按原图坐标输出。",
+)
+image_format = st.sidebar.radio(
+    "标注图片格式", ["jpeg", "png"], index=0,
+    help="JPEG 响应体积更小；PNG 无损，但体积约为前者的 10 倍。",
+)
+
+st.sidebar.divider()
+
+if backend == REST_BACKEND_LABEL:
+    if st.sidebar.button("🔌 测试连接", width="stretch"):
+        try:
+            info = api_health(api_url)
+            gpu = info.get("gpu") or {}
+            st.sidebar.success(
+                f"连接成功 · v{info['version']}\n\n"
+                f"运行设备：`{info['device']}`" + (f"\n\nGPU：{gpu.get('name')}" if gpu else "")
+            )
+        except requests.RequestException as exc:
+            st.sidebar.error(
+                f"无法连接：{exc}\n\n请先启动后端（Windows 可双击项目根目录的"
+                f"「一键启动.bat」）：\n\n"
+                f"`uvicorn api:app --reload --port 8000`"
+            )
+    if st.sidebar.button("🔥 预热模型", width="stretch"):
+        with st.sidebar.status("正在加载权重并预热…", expanded=True) as status:
+            try:
+                info = api_warmup(api_url, model, device)
+                status.update(label="模型已就绪", state="complete")
+                st.write(
+                    f"已在 `{info['device']}` 上加载 `{info['model']}` "
+                    f"（{info['classes']} 个类别），耗时 {info['total_ms']:.0f} ms。"
+                )
+            except requests.RequestException as exc:
+                status.update(label="预热失败", state="error")
+                st.write(str(exc))
+
+settings = {
+    "backend": backend,
+    "api_url": api_url,
+    "model": model,
+    "confidence": confidence,
+    "iou": iou,
+    "device": device,
+    "image_format": image_format,
+    "max_size": max_size,
 }
 
+st.sidebar.divider()
+st.sidebar.caption(
+    "模型列表会自动读取：内置别名来自后端，`models/` 目录里每个 `.pt` 都会出现在下拉框中"
+    f"（当前 {len(model_options)} 个）。把新权重放进去后点「🔄 刷新」即可。"
+)
+if backend == REST_BACKEND_LABEL:
+    st.sidebar.caption(
+        "⚠️ `ALLOW_CUSTOM_MODEL_UPLOAD` 默认开启。`.pt` 文件本质上是 pickle，"
+        "因此请只上传你信任的模型，并让 API 保持在本机监听。"
+    )
+
+
 # ============================================================
-# MAIN APP
+# MAIN
 # ============================================================
 
-def main():
-    # Header
-    st.markdown("<h1 style='text-align: center; color: #00ffaa; font-size: 3em; margin-bottom: 0;'>✨ QUANTUM DREAM ATLAS ✨</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #888; font-size: 1.2em;'>336 Nobel-Tier Visualizations Across 21 Advanced Domains</p>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #00ffaa; font-size: 0.9em; margin-bottom: 2em;'>🌌 Every plot dynamically generated • Random seed: {} • Pure aesthetic perfection 🌌</p>".format(st.session_state.master_seed), unsafe_allow_html=True)
-    
-    # Regenerate button
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        if st.button("🔄 REGENERATE ALL", width='stretch'):
-            st.session_state.master_seed = np.random.randint(0, 1000000)
-            st.rerun()
-    
-    st.divider()
-    
-    # Generate all subjects
-    plot_counter = 0
-    for subject_name, subject_data in SUBJECTS.items():
-        with st.expander(f"{subject_data['icon']} {subject_name.upper()}", expanded=False):
-            st.markdown(f"<h3 style='color: #00ffaa;'>{subject_data['icon']} {subject_name}</h3>", unsafe_allow_html=True)
-            
-            plots = subject_data['plots']
-            
-            # Display in rows of 4 plots
-            for row_start in range(0, len(plots), 4):
-                row_plots = plots[row_start:row_start + 4]
-                cols = st.columns(len(row_plots))
-                
-                for col_idx, (plot_title, plot_func, colorscale_arg) in enumerate(row_plots):
-                    with cols[col_idx]:
-                        try:
-                            seed = get_seed(plot_counter)
-                            subject_id = list(SUBJECTS.keys()).index(subject_name)
-                            plot_id = row_start + col_idx
-                            
-                            if colorscale_arg:
-                                fig = plot_func(seed, subject_id, plot_id, colorscale_arg)
-                            else:
-                                fig = plot_func(seed, subject_id, plot_id)
-                            
-                            st.plotly_chart(fig, width='stretch', config={'displayModeBar': False})
-                            st.caption(f"**{plot_title}**")
-                        except Exception as e:
-                            st.error(f"Plot error: {str(e)[:50]}")
-                        
-                        plot_counter += 1
-    
-    # Footer
-    st.divider()
-    st.markdown("<p style='text-align: center; color: #666; font-size: 0.9em;'>Created with ❤️ for the beauty of science</p>", unsafe_allow_html=True)
-    st.markdown(f"<p style='text-align: center; color: #444; font-size: 0.8em;'>Total plots: {plot_counter} | Master seed: {st.session_state.master_seed}</p>", unsafe_allow_html=True)
+st.title("🎯 " + APP_TITLE)
+st.caption(
+    "在浏览器中使用 YOLOv8 / YOLO11 —— 上传图片、调用摄像头或通过 URL 加载图片。"
+    "检测框、类别标签和置信度会绘制在图片上，并在下方汇总展示。"
+)
 
-if __name__ == "__main__":
-    main()
+upload_tab, webcam_tab, url_tab = st.tabs(["📁 上传图片", "📷 摄像头", "🔗 图片 URL"])
+
+with upload_tab:
+    uploaded = st.file_uploader(
+        "选择图片", type=IMAGE_TYPES, label_visibility="collapsed"
+    )
+    if uploaded is not None:
+        st.image(uploaded, caption=f"{uploaded.name} · {uploaded.size / 1024:.0f} KB", width="stretch")
+        if st.button("🚀 开始检测", type="primary", key="detect_upload"):
+            run_detection(uploaded.getvalue(), uploaded.name, settings)
+    else:
+        st.info("上传一张 JPG、PNG、WebP 或 BMP 图片即可开始。")
+
+with webcam_tab:
+    shot = st.camera_input("拍摄照片")
+    if shot is not None:
+        if st.button("🚀 开始检测", type="primary", key="detect_webcam"):
+            run_detection(shot.getvalue(), "webcam.jpg", settings)
+    else:
+        st.info("请允许浏览器访问摄像头，然后拍摄一帧画面。")
+
+with url_tab:
+    url = st.text_input("图片 URL", placeholder="https://example.com/photo.jpg")
+    if st.button("🚀 开始检测", type="primary", key="detect_url"):
+        try:
+            payload, filename = fetch_image_url(url)
+        except BackendError as exc:
+            st.error(str(exc))
+        else:
+            st.image(payload, caption=f"{filename} · {len(payload) / 1024:.0f} KB", width="stretch")
+            run_detection(payload, filename, settings)
+
+render_results()
+
+with st.expander("API 参考", expanded=False):
+    st.markdown(
+        """
+前端调用的接口与你可以手动调用的接口完全一致：
+
+```bash
+curl -X POST http://localhost:8000/detect \\
+  -F 'file=@test_image.jpg' \\
+  -F 'confidence=0.5' \\
+  -F 'model=yolov8n'
+```
+
+其他接口：`GET /health`、`GET /models`、`POST /warmup`、
+`POST /models/upload`、`POST /detect/image`（返回标注后的 PNG 图片）。
+交互式接口文档：<http://127.0.0.1:8000/docs>
+        """
+    )
