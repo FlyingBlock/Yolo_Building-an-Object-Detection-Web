@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local configuration
+.env
+
+# Model weights (downloaded automatically on first run)
+*.pt
+*.part
+*.onnx
+*.engine
+*.tflite
+# The directory itself is kept (it is the UI's drop-in location for custom weights)
+models/*
+!models/.gitkeep
+
+# Launcher service logs
+logs/
+
+# Detection output
+results/
+runs/
+*_annotated.jpg
+*_annotated.png
+detect_out.json
+api_annotated.png
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
